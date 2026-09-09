@@ -366,196 +366,87 @@ CloudWatch
  └─ Lambda logs
 ```
 
-**순서는 `01_network.sh → EC2 curl → RDS 실제 SQL → DynamoDB → Lambda → CloudWatch → 전체 삭제`가 제일 깔끔해.** 지금은 먼저 `01_network.sh`가 IAM 권한 추가 후 성공해야 다음 리소스 ID를 그대로 이어서 쓸 수 있어.
+`group ingress`는 쉽게 말하면 **Security Group의 “들어오는 트래픽(inbound) 허용 규칙”**이야.
 
-먼저:
+아까 실행한:
 
-source ~/aws-demo.env
-1. RDS를 Private Subnet에 생성
-
-RDS는 DB subnet group에 서로 다른 AZ의 subnet이 필요해서 우리가 private subnet을 2개 만든 거야.
-
-DB_ID="demo-postgres"
-
-aws rds create-db-subnet-group \
-  --db-subnet-group-name demo-rds-subnets \
-  --db-subnet-group-description "Demo private RDS subnets" \
-  --subnet-ids "$PRIVATE_SUBNET1" "$PRIVATE_SUBNET2" \
-  --region "$REGION"
-
-PostgreSQL 생성:
-
-aws rds create-db-instance \
-  --db-instance-identifier "$DB_ID" \
-  --db-instance-class db.t3.micro \
-  --engine postgres \
-  --master-username demoadmin \
-  --master-user-password 'DemoPass1234!' \
-  --allocated-storage 20 \
-  --storage-type gp3 \
-  --db-subnet-group-name demo-rds-subnets \
-  --vpc-security-group-ids "$RDS_SG" \
-  --no-publicly-accessible \
-  --no-multi-az \
-  --backup-retention-period 0 \
-  --region "$REGION"
-
-RDS는 생성에 몇 분 걸려.
-
-aws rds wait db-instance-available \
-  --db-instance-identifier "$DB_ID" \
-  --region "$REGION"
-
-Endpoint 가져오기:
-
-RDS_ENDPOINT=$(aws rds describe-db-instances \
-  --db-instance-identifier "$DB_ID" \
-  --region "$REGION" \
-  --query 'DBInstances[0].Endpoint.Address' \
-  --output text)
-
-echo $RDS_ENDPOINT
-2. EC2 → RDS 실제 접속
-
-우리가 만든 firewall이:
-
-EC2_SG
-   │
-   │ TCP 5432 허용
-   ▼
-RDS_SG
-
-이므로 EC2에서는 RDS에 접근할 수 있어.
-
-EC2에 SSH해서 PostgreSQL client 설치:
-
-sudo dnf install -y postgresql15
-
-그리고:
-
-psql \
-  -h "$RDS_ENDPOINT" \
-  -U demoadmin \
-  -d postgres
-
-단, $RDS_ENDPOINT 변수는 네 로컬 shell 변수라 EC2 SSH 세션에는 자동 전달되지 않아. 따라서 EC2 안에서는 실제 출력된 endpoint를 넣으면 돼:
-
-psql \
-  -h demo-postgres.xxxxxxxxx.us-east-1.rds.amazonaws.com \
-  -U demoadmin \
-  -d postgres
-
-password:
-
-DemoPass1234!
-
-접속되면:
-
-CREATE TABLE demo (
-    id SERIAL PRIMARY KEY,
-    message TEXT
-);
-
-INSERT INTO demo(message)
-VALUES ('Hello from EC2');
-
-SELECT * FROM demo;
-
-결과:
-
- id |    message
-----+----------------
-  1 | Hello from EC2
-
-이 순간 실제로:
-
-EC2
-10.0.1.x
-   │
-   │ VPC local routing
-   │ TCP 5432
-   ▼
-RDS Security Group
-   │
-   ▼
-RDS PostgreSQL
-10.0.2/3.x
-
-까지 성공한 거야.
-
-3. Security Group 효과도 직접 확인
-
-이게 네트워크 실습에서 꽤 중요해.
-
-로컬 터미널에서 현재 허용했던 rule을 제거:
-
-aws ec2 revoke-security-group-ingress \
-  --group-id "$RDS_SG" \
-  --protocol tcp \
-  --port 5432 \
-  --source-group "$EC2_SG" \
-  --region "$REGION"
-
-EC2에서 다시:
-
-psql \
-  -h <RDS_ENDPOINT> \
-  -U demoadmin \
-  -d postgres
-
-하면 timeout이 나야 정상.
-
-다시 firewall 열기:
-
+```bash
 aws ec2 authorize-security-group-ingress \
   --group-id "$RDS_SG" \
   --protocol tcp \
   --port 5432 \
-  --source-group "$EC2_SG" \
-  --region "$REGION"
+  --source-group "$EC2_SG"
+```
 
-다시 psql 하면 성공.
+를 해석하면:
 
-이걸로 Security Group = 실제 network firewall이라는 걸 확인한 거야.
-4. DynamoDB 만들기
+```text
+authorize = 허용해라
+security-group = 방화벽에
+ingress = 들어오는 트래픽을
 
-이제 DynamoDB.
+RDS_SG 방화벽에
+TCP 5432번 포트로
+EC2_SG가 붙은 리소스에서 오는 연결을 허용해라
+```
 
-aws dynamodb create-table \
-  --table-name DemoUsers \
-  --attribute-definitions AttributeName=user_id,AttributeType=S \
-  --key-schema AttributeName=user_id,KeyType=HASH \
-  --billing-mode PAY_PER_REQUEST \
-  --region "$REGION"
+그래서 구조가:
 
-기다리고:
+```text
+EC2
+[EC2_SG]
+   │
+   │ TCP :5432
+   ▼
+[RDS_SG]  ← ingress rule 검사
+   │
+   │ 허용
+   ▼
+PostgreSQL RDS
+```
 
-aws dynamodb wait table-exists \
-  --table-name DemoUsers \
-  --region "$REGION"
+반대로 이것:
 
-데이터 하나 넣자.
+```bash
+aws ec2 revoke-security-group-ingress \
+  --group-id "$RDS_SG" \
+  --protocol tcp \
+  --port 5432 \
+  --source-group "$EC2_SG"
+```
 
-aws dynamodb put-item \
-  --table-name DemoUsers \
-  --item '{
-    "user_id": {"S": "user-001"},
-    "name": {"S": "Alice"},
-    "score": {"N": "95"}
-  }' \
-  --region "$REGION"
+은 **그 inbound 허용 규칙을 제거**하는 거야.
 
-확인:
+그래서:
 
-aws dynamodb get-item \
-  --table-name DemoUsers \
-  --key '{"user_id":{"S":"user-001"}}' \
-  --region "$REGION"
+```text
+authorize-security-group-ingress
+→ 방화벽 inbound OPEN
 
-여기까지:
+revoke-security-group-ingress
+→ 방화벽 inbound rule 제거
+```
 
-DynamoDB
-└── DemoUsers
-      └── user-001
-           ├── Alice
-           └── 95
+라고 생각하면 돼.
+
+참고로 반대 방향도 있어:
+
+```text
+Ingress = 들어오는 것
+Egress  = 나가는 것
+```
+
+예를 들어:
+
+```text
+                    RDS_SG
+                       │
+EC2 ── 5432 ──────────►│ RDS
+                       │
+                    ingress
+```
+
+여기서 우리가 `--source-group "$EC2_SG"`를 쓴 게 꽤 중요한 포인트야. `10.0.1.0/24`처럼 IP 범위 전체를 허용한 게 아니라 **“EC2_SG가 붙은 리소스”를 source로 허용**한 거야.
+
+즉 AWS Security Group을 처음 배울 때는 그냥 **`ingress = inbound firewall rule`**이라고 기억하면 된다.
+
