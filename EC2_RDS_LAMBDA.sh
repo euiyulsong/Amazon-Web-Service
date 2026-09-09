@@ -517,3 +517,45 @@ aws ec2 authorize-security-group-ingress \
 다시 psql 하면 성공.
 
 이걸로 Security Group = 실제 network firewall이라는 걸 확인한 거야.
+4. DynamoDB 만들기
+
+이제 DynamoDB.
+
+aws dynamodb create-table \
+  --table-name DemoUsers \
+  --attribute-definitions AttributeName=user_id,AttributeType=S \
+  --key-schema AttributeName=user_id,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
+  --region "$REGION"
+
+기다리고:
+
+aws dynamodb wait table-exists \
+  --table-name DemoUsers \
+  --region "$REGION"
+
+데이터 하나 넣자.
+
+aws dynamodb put-item \
+  --table-name DemoUsers \
+  --item '{
+    "user_id": {"S": "user-001"},
+    "name": {"S": "Alice"},
+    "score": {"N": "95"}
+  }' \
+  --region "$REGION"
+
+확인:
+
+aws dynamodb get-item \
+  --table-name DemoUsers \
+  --key '{"user_id":{"S":"user-001"}}' \
+  --region "$REGION"
+
+여기까지:
+
+DynamoDB
+└── DemoUsers
+      └── user-001
+           ├── Alice
+           └── 95
