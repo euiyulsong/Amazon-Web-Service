@@ -367,3 +367,153 @@ CloudWatch
 ```
 
 **순서는 `01_network.sh → EC2 curl → RDS 실제 SQL → DynamoDB → Lambda → CloudWatch → 전체 삭제`가 제일 깔끔해.** 지금은 먼저 `01_network.sh`가 IAM 권한 추가 후 성공해야 다음 리소스 ID를 그대로 이어서 쓸 수 있어.
+
+먼저:
+
+source ~/aws-demo.env
+1. RDS를 Private Subnet에 생성
+
+RDS는 DB subnet group에 서로 다른 AZ의 subnet이 필요해서 우리가 private subnet을 2개 만든 거야.
+
+DB_ID="demo-postgres"
+
+aws rds create-db-subnet-group \
+  --db-subnet-group-name demo-rds-subnets \
+  --db-subnet-group-description "Demo private RDS subnets" \
+  --subnet-ids "$PRIVATE_SUBNET1" "$PRIVATE_SUBNET2" \
+  --region "$REGION"
+
+PostgreSQL 생성:
+
+aws rds create-db-instance \
+  --db-instance-identifier "$DB_ID" \
+  --db-instance-class db.t3.micro \
+  --engine postgres \
+  --master-username demoadmin \
+  --master-user-password 'DemoPass1234!' \
+  --allocated-storage 20 \
+  --storage-type gp3 \
+  --db-subnet-group-name demo-rds-subnets \
+  --vpc-security-group-ids "$RDS_SG" \
+  --no-publicly-accessible \
+  --no-multi-az \
+  --backup-retention-period 0 \
+  --region "$REGION"
+
+RDS는 생성에 몇 분 걸려.
+
+aws rds wait db-instance-available \
+  --db-instance-identifier "$DB_ID" \
+  --region "$REGION"
+
+Endpoint 가져오기:
+
+RDS_ENDPOINT=$(aws rds describe-db-instances \
+  --db-instance-identifier "$DB_ID" \
+  --region "$REGION" \
+  --query 'DBInstances[0].Endpoint.Address' \
+  --output text)
+
+echo $RDS_ENDPOINT
+2. EC2 → RDS 실제 접속
+
+우리가 만든 firewall이:
+
+EC2_SG
+   │
+   │ TCP 5432 허용
+   ▼
+RDS_SG
+
+이므로 EC2에서는 RDS에 접근할 수 있어.
+
+EC2에 SSH해서 PostgreSQL client 설치:
+
+sudo dnf install -y postgresql15
+
+그리고:
+
+psql \
+  -h "$RDS_ENDPOINT" \
+  -U demoadmin \
+  -d postgres
+
+단, $RDS_ENDPOINT 변수는 네 로컬 shell 변수라 EC2 SSH 세션에는 자동 전달되지 않아. 따라서 EC2 안에서는 실제 출력된 endpoint를 넣으면 돼:
+
+psql \
+  -h demo-postgres.xxxxxxxxx.us-east-1.rds.amazonaws.com \
+  -U demoadmin \
+  -d postgres
+
+password:
+
+DemoPass1234!
+
+접속되면:
+
+CREATE TABLE demo (
+    id SERIAL PRIMARY KEY,
+    message TEXT
+);
+
+INSERT INTO demo(message)
+VALUES ('Hello from EC2');
+
+SELECT * FROM demo;
+
+결과:
+
+ id |    message
+----+----------------
+  1 | Hello from EC2
+
+이 순간 실제로:
+
+EC2
+10.0.1.x
+   │
+   │ VPC local routing
+   │ TCP 5432
+   ▼
+RDS Security Group
+   │
+   ▼
+RDS PostgreSQL
+10.0.2/3.x
+
+까지 성공한 거야.
+
+3. Security Group 효과도 직접 확인
+
+이게 네트워크 실습에서 꽤 중요해.
+
+로컬 터미널에서 현재 허용했던 rule을 제거:
+
+aws ec2 revoke-security-group-ingress \
+  --group-id "$RDS_SG" \
+  --protocol tcp \
+  --port 5432 \
+  --source-group "$EC2_SG" \
+  --region "$REGION"
+
+EC2에서 다시:
+
+psql \
+  -h <RDS_ENDPOINT> \
+  -U demoadmin \
+  -d postgres
+
+하면 timeout이 나야 정상.
+
+다시 firewall 열기:
+
+aws ec2 authorize-security-group-ingress \
+  --group-id "$RDS_SG" \
+  --protocol tcp \
+  --port 5432 \
+  --source-group "$EC2_SG" \
+  --region "$REGION"
+
+다시 psql 하면 성공.
+
+이걸로 Security Group = 실제 network firewall이라는 걸 확인한 거야.
